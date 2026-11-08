@@ -1,0 +1,289 @@
+---
+title: "cancer-survival-gene-analysis"
+output:
+  word_document: default
+  html_document: default
+  pdf_document: default
+date: "2026-03-16"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+
+```{r}
+library(TCGAbiolinks)
+library(SummarizedExperiment)
+query <- GDCquery(
+  project = "TCGA-BRCA",
+  data.category = "Transcriptome Profiling",
+  data.type = "Gene Expression Quantification",
+  workflow.type = "STAR - Counts"
+)
+GDCdownload(query)
+data <- GDCprepare(query)
+```
+```{r}
+
+clinical_df <- as.data.frame(colData(data))
+
+
+genes_df <- as.data.frame(rowData(data))
+
+
+
+expression_df <- as.data.frame(assay(data))
+
+```
+
+```{r}
+
+head(clinical_df)      
+#head(genes_df)         
+#head(expression_df[1:6, 1:5])  
+```
+
+```{r}
+clinical_df_tumor <- clinical_df[clinical_df$sample_type == "Primary Tumor", ]
+
+library(dplyr)
+clinical_df_tumor <- clinical_df_tumor |>
+  group_by(patient) |>
+  arrange(desc(days_to_last_follow_up)) |>
+  slice(1) |>
+  ungroup()
+
+
+sum(duplicated(clinical_df_tumor$patient))
+nrow(clinical_df_tumor)
+
+
+clinical_df_tumor$survival_group <- ifelse(
+  clinical_df_tumor$vital_status == "Dead" & 
+  clinical_df_tumor$follow_ups_disease_response == "WT-With Tumor",
+  "Did Not Survive",
+  ifelse(
+    clinical_df_tumor$vital_status == "Alive" & 
+    clinical_df_tumor$follow_ups_disease_response == "TF-Tumor Free",
+    "Survived",
+    "Unknown"
+  )
+)
+```
+```{r}
+
+expr_matrix <- assay(data)  # raw counts
+
+
+
+clinical_filtered <- clinical_df_tumor %>%
+  filter(survival_group %in% c("Survived", "Did Not Survive"))
+
+
+common_patients <- intersect(colnames(expr_matrix), clinical_filtered$barcode)
+expr_filtered <- expr_matrix[, common_patients]
+clinical_filtered <- clinical_filtered[match(common_patients, clinical_filtered$barcode), ]
+
+```
+
+
+```{r}
+
+library(DESeq2)
+
+
+dds <- DESeqDataSetFromMatrix(
+  countData = expr_filtered,
+  colData = clinical_filtered,
+  design = ~ survival_group
+)
+
+
+keep <- rowSums(counts(dds) >= 10) >= 10
+dds <- dds[keep, ]
+
+
+dds$survival_group <- relevel(dds$survival_group, ref = "Did Not Survive")
+
+
+dds <- DESeq(dds)
+res <- results(dds, contrast = c("survival_group", "Survived", "Did Not Survive"))
+res_df <- as.data.frame(res) %>% arrange(padj)
+head(res_df, 10)
+```
+```{r}
+head(res_df, 10)
+```
+
+
+```{r}
+
+res_df[rownames(res_df) == "ENSG00000134827.8", ]
+```
+
+
+```{r}
+normalized_counts <- counts(dds, normalized = TRUE)
+
+
+survivor_counts    <- normalized_counts[, dds$survival_group == "Survived"]
+nonsurvivor_counts <- normalized_counts[, dds$survival_group == "Did Not Survive"]
+
+
+mean_survivors    <- rowMeans(survivor_counts)
+mean_nonsurvivors <- rowMeans(nonsurvivor_counts)
+
+
+
+alpha_survivors <- apply(survivor_counts, 1, function(x) {
+  m <- mean(x)
+  v <- var(x)
+  if (m == 0) NA_real_ else (v - m) / m^2
+})
+
+alpha_nonsurvivors <- apply(nonsurvivor_counts, 1, function(x) {
+  m <- mean(x)
+  v <- var(x)
+  if (m == 0) NA_real_ else (v - m) / m^2
+})
+
+
+disp_raw <- mcols(dds)$dispGeneEst 
+disp_shrunken <- dispersions(dds)
+
+nb_var_survivors    <- mean_survivors + alpha_survivors * mean_survivors^2
+nb_var_nonsurvivors <- mean_nonsurvivors + alpha_nonsurvivors * mean_nonsurvivors^2
+
+log2FC <- log2(mean_survivors / mean_nonsurvivors)
+
+n1 <- ncol(survivor_counts)
+n2 <- ncol(nonsurvivor_counts)
+
+se_log2FC <- sqrt(
+  (nb_var_survivors / (n1 * mean_survivors^2)) +
+  (nb_var_nonsurvivors / (n2 * mean_nonsurvivors^2))
+) / log(2)
+
+
+z_approx <- log2FC / se_log2FC
+
+pval_approx <- 2 * pnorm(-abs(z_approx))
+
+padj_approx <- p.adjust(pval_approx, method = "BH")
+
+# Put into a dataframe
+mean_var_df <- data.frame(
+  gene                      = rownames(normalized_counts),
+  mean_survivors            = mean_survivors,
+  mean_nonsurvivors         = mean_nonsurvivors,
+  #alpha_survivors = alpha_survivors,
+  #alpha_nonsurvivors = alpha_nonsurvivors,
+  nb_var_survivors = nb_var_survivors,
+  nb_var_nonsurvivors = nb_var_nonsurvivors,
+ # DESeqdisp_raw = disp_raw,
+  #DESeqdisp_shrunken = disp_shrunken,
+  #se_log2FC = se_log2FC,
+  z_approx = z_approx,
+  pval_approx               = pval_approx#,
+#  padj_approx               = padj_approx
+)
+
+
+
+
+
+mean_var_df <- mean_var_df %>%
+  arrange(padj_approx)
+head(mean_var_df)
+```
+```{r}
+mean_var_df[rownames(mean_var_df) == "ENSG00000134827.8",]
+
+```
+
+```{r}
+
+  normalized_counts <- counts(dds, normalized = TRUE)
+
+# Extract that one gene
+gene_counts <- normalized_counts["ENSG00000134827.8", ]
+
+gene_df <- data.frame(
+  counts         = gene_counts,
+  log_counts     = log2(gene_counts + 1),
+  survival_group = dds$survival_group
+)
+
+
+ggplot(gene_df, aes(x = log_counts, fill = survival_group)) +
+  geom_density(alpha = 0.5) +
+  labs(
+    title = "Distribution of ENSG00000134827.8 Expression (log2)",
+    x     = "log2(Normalized Counts + 1)",
+    y     = "Density",
+    fill  = "Survival Group"
+  ) +
+  theme_minimal() +
+  geom_vline(
+    data = gene_df %>% group_by(survival_group) %>% 
+           summarise(mean = mean(log_counts)),
+    aes(xintercept = mean, color = survival_group),
+    linetype = "dashed",
+    size = 1
+  )
+```
+
+
+This will show you the duplicated patients sorted alphabetically so you can clearly see each patient appearing twice with their different sample types side by side like:
+```
+TCGA-XX-XXXX    Primary Tumor
+TCGA-XX-XXXX    Solid Tissue Normal
+TCGA-YY-YYYY    Primary Tumor
+TCGA-YY-YYYY    Solid Tissue Normal
+```
+
+
+
+```{r}
+gene_id <- "ENSG00000134827.8"
+
+
+m1 <- mean_survivors[gene_id]
+m2 <- mean_nonsurvivors[gene_id]
+nb_v1 <- nb_var_survivors[gene_id]
+nb_v2 <- nb_var_nonsurvivors[gene_id]
+
+
+log2FC <- log2(m1 / m2)
+
+
+var_log2_s  <- nb_v1  / (m1^2 * log(2)^2)
+var_log2_ns <- nb_v2  / (m2^2 * log(2)^2)
+
+
+pooled_sd <- sqrt((var_log2_s + var_log2_ns) / 2)
+
+
+
+power.t.test(
+  n           = (2 / (1 / n1 + 1 / n2)),
+  delta       = abs(log2FC),
+  sd          = pooled_sd,
+  sig.level   = 0.05,
+  type        = "two.sample",
+  alternative = "two.sided"
+)
+
+
+power.t.test(
+  n           = NULL,
+  delta       = abs(log2FC),
+  sd          = pooled_sd,
+  sig.level   = 0.05,
+  power       = 0.99,
+  type        = "two.sample",
+  alternative = "two.sided"
+)
+```
+
